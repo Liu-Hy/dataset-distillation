@@ -1,5 +1,6 @@
 import logging
 import time
+import math
 
 import numpy as np
 import torch
@@ -81,6 +82,9 @@ class Trainer(object):
 
     def forward(self, model, rdata, rlabel, steps):
         state = self.state
+        if state.dp == 'A':
+            noise_multiplier = state.max_grad_norm / state.epsilon * math.sqrt(2 * math.log(1.25 / state.delta))
+            # print(f"Noise Multiplier: {noise_multiplier}")
 
         # forward
         model.train()
@@ -89,10 +93,27 @@ class Trainer(object):
         gws = []
 
         for step_i, (data, label, lr) in enumerate(steps):
-            with torch.enable_grad():
-                output = model.forward_with_param(data, w)
-                loss = task_loss(state, output, label)
-            gw, = torch.autograd.grad(loss, w, lr.squeeze(), create_graph=True)
+            if state.dp != 'A':
+                with torch.enable_grad():
+                    output = model.forward_with_param(data, w)
+                    loss = task_loss(state, output, label)
+                gw, = torch.autograd.grad(loss, w, lr.squeeze(), create_graph=True)
+            else:
+                gradients = []
+                for x, y in zip(data, label):
+                    with torch.enable_grad():
+                        output = model.forward_with_param(x.unsqueeze(0), w)
+                        loss = task_loss(state, output, y.unsqueeze(0))
+                    gw_i, = torch.autograd.grad(loss, w, create_graph=True)
+                    clip_coef = state.max_grad_norm / (gw_i.data.norm(2) + 1e-7)
+                    if clip_coef < 1:
+                        gw_i.mul_(clip_coef)
+                    gradients.append(gw_i)
+                gradients = torch.stack(gradients).mean(dim=0)
+                noise = torch.randn_like(gradients) * noise_multiplier
+                gw = gradients + noise
+
+                gw = lr.squeeze() * gw
 
             with torch.no_grad():
                 new_w = w.sub(gw).requires_grad_()
@@ -173,7 +194,10 @@ class Trainer(object):
             bwd_out += list(lrs)
             bwd_grad += list(glrs)
             for d, g in zip(datas, gdatas):
-                d.grad.add_(g)
+                if d.grad is not None:
+                    d.grad.add_(g)
+                else:
+                    d.grad = g.clone()
         if len(bwd_out) > 0:
             torch.autograd.backward(bwd_out, bwd_grad)
 

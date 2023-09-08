@@ -312,6 +312,12 @@ class BaseOptions(object):
                                  'be either MASTER_PORT & MASTER_ADDR, or INIT_FILE. '
                                  'Then it stores the values in state as "distributed_master_addr", '
                                  '"distributed_master_port", etc. Only rank 0 process writes checkpoints. ')
+        parser.add_argument('--dp', type=str, choices=['none', 'A', 'B'], default='none', help='Differential privacy setting')
+        parser.add_argument('--epsilon', type=float, default=10., help='parameter for differential privacy')
+        parser.add_argument('--delta', type=float, default=1e-5, help='parameter for differential privacy')
+        parser.add_argument('--max-grad-norm', type=float, default=1.0, help='parameter for differential privacy')
+
+
 
     def get_dummy_state(self, *cmdargs, yaml_file=None, **opt_pairs):
         if yaml_file is None:
