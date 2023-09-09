@@ -230,6 +230,9 @@ class Trainer(object):
         grad_divisor = state.sample_n_nets  # i.e., global sample_n_nets
         ckpt_int = state.checkpoint_interval
 
+        if state.dp == 'B':
+            noise_multiplier = state.max_grad_norm / state.epsilon * math.sqrt(2 * math.log(1.25 / state.delta))
+
         data_t0 = time.time()
 
         for epoch, it, (rdata, rlabel) in self.prefetch_train_loader_iter():
@@ -283,6 +286,19 @@ class Trainer(object):
             else:
                 for t in all_reduce_tensors:
                     t.div_(grad_divisor)
+
+            if state.dp == 'B':
+                for g in all_reduce_tensors:  # excluding the last element: learning rate
+                    if g.dim() != 4:
+                        continue
+                    assert len(g) == self.num_per_step, print(g.shape, self.num_per_step)
+                    for img_grad in g:
+                        clip_coef = state.max_grad_norm / (img_grad.data.norm(2) + 1e-7)
+                        #print(clip_coef)
+                        if clip_coef < 1:
+                            img_grad.mul_(clip_coef)
+                    noise = torch.randn_like(g) * noise_multiplier
+                    g.add_(noise)
 
             # opt step
             self.optimizer.step()
