@@ -82,7 +82,7 @@ class Trainer(object):
 
     def forward(self, model, rdata, rlabel, steps):
         state = self.state
-        if state.dp == 'A':
+        if state.dp != 'none':
             noise_multiplier = state.max_grad_norm / state.epsilon * math.sqrt(2 * math.log(1.25 / state.delta))
             # print(f"Noise Multiplier: {noise_multiplier}")
 
@@ -94,15 +94,12 @@ class Trainer(object):
         points = []
 
         for step_i, (data, label, lr) in enumerate(steps):
-            if state.dp != 'A':
+            if state.dp != 'none':
                 with torch.enable_grad():
                     output = model.forward_with_param(data, w)
                     loss = task_loss(state, output, label)
                 gw, = torch.autograd.grad(loss, w, lr.squeeze(), create_graph=True)
             else:
-                if step_i == 0:
-                    print('Part A num_iterations: ', len(steps))
-                    print('Part A batch_size: ', len(data))
                 gradients = []
                 for x, y in zip(data, label):
                     with torch.enable_grad():
@@ -237,23 +234,19 @@ class Trainer(object):
 
         if state.dp == 'B':
             noise_multiplier = state.max_grad_norm / state.epsilon * math.sqrt(2 * math.log(1.25 / state.delta))
+            state.batch_size = 1
+            print('state.batch_size set to ', state.batch_size)
 
         data_t0 = time.time()
 
-        e_points = []
         f_points = []
         for epoch, it, (rdata, rlabel) in self.prefetch_train_loader_iter():
-            print(it)
             data_t = time.time() - data_t0
             if it == 0 and epoch > 0:
-                if len(e_points) > 0:
-                    print(f'Part A Epoch {epoch}, min: {np.min(e_points)}, max: {np.max(e_points)}, median: {np.median(e_points)},'
-                          f'mean: {np.mean(e_points)}, variance: {np.var(e_points)}')
-                e_points = []
                 if len(f_points) > 0:
-                    print(f'Part B Epoch {epoch}, min: {np.min(f_points)}, max: {np.max(f_points)}, median: {np.median(f_points)},'
+                    print(f'Part B Epoch {epoch} cumulative statistics. min: {np.min(f_points)}, max: {np.max(f_points)}, median: {np.median(f_points)},'
                           f'mean: {np.mean(f_points)}, variance: {np.var(f_points)}')
-                f_points = []
+                # f_points = []
 
             if it == 0:
                 self.scheduler.step()
@@ -286,7 +279,6 @@ class Trainer(object):
                     model.reset(state)
 
                 l, saved, points = self.forward(model, rdata, rlabel, steps)
-                e_points.extend(points)
 
                 losses.append(l.detach())
                 grad_infos.append(self.backward(model, rdata, rlabel, steps, saved))
@@ -297,7 +289,6 @@ class Trainer(object):
             # average grad
             all_reduce_tensors = [p.grad for p in self.params]
             b_bs = sum([len(p) for p in self.params if p.dim()==4])
-            print('Part B batchsize: ', b_bs)
             if do_log_this_iter:
                 losses = torch.stack(losses, 0).sum()
                 all_reduce_tensors.append(losses)
@@ -313,14 +304,16 @@ class Trainer(object):
                     if g.dim() != 4:
                         continue
                     assert len(g) == self.num_per_step, print(g.shape, self.num_per_step)
-                    for img_grad in g:
-                        f_points.append(img_grad.data.norm(2).item())
-                        clip_coef = state.max_grad_norm / (img_grad.data.norm(2) + 1e-7)
+                    #for img_grad in g:
+                        #f_points.append(img_grad.data.norm(2).item())
+                        # clip_coef = state.max_grad_norm / (img_grad.data.norm(2) + 1e-7)
                         #print(clip_coef)
                         #if clip_coef < 1:
                             #img_grad.mul_(clip_coef)
                     #noise = torch.randn_like(g) * noise_multiplier
                     #g.add_(noise)
+                flatten_gd = torch.cat([g.view(-1) for g in all_reduce_tensors if g.dim() == 4])
+                f_points.append(flatten_gd.data.norm(2).item())
 
             # opt step
             self.optimizer.step()

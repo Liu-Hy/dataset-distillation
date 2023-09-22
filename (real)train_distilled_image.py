@@ -82,7 +82,7 @@ class Trainer(object):
 
     def forward(self, model, rdata, rlabel, steps):
         state = self.state
-        if state.dp == 'A':
+        if state.dp != 'none':
             noise_multiplier = state.max_grad_norm / state.epsilon * math.sqrt(2 * math.log(1.25 / state.delta))
             # print(f"Noise Multiplier: {noise_multiplier}")
 
@@ -297,7 +297,7 @@ class Trainer(object):
                         #print(clip_coef)
                         if clip_coef < 1:
                             img_grad.mul_(clip_coef)
-                    noise = torch.randn_like(g) * noise_multiplier
+                    noise = torch.randn_like(g) * noise_multiplier * state.max_grad_norm
                     g.add_(noise)
 
             # opt step

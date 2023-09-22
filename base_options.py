@@ -231,7 +231,7 @@ class BaseOptions(object):
                             help='base random seed (default: 1)')
         parser.add_argument('--log_interval', type=int, default=100, metavar='N',
                             help='how many batches to wait before logging training status')
-        parser.add_argument('--checkpoint_interval', type=int, default=10, metavar='N',
+        parser.add_argument('--checkpoint_interval', type=int, default=1, metavar='N',
                             help='checkpoint interval (epoch)')
         parser.add_argument('--dataset', type=str, default='MNIST',
                             help='dataset: MNIST | Cifar10 | PASCAL_VOC | CUB200')
@@ -316,7 +316,7 @@ class BaseOptions(object):
         parser.add_argument('--epsilon', type=float, default=10., help='parameter for differential privacy')
         parser.add_argument('--delta', type=float, default=1e-5, help='parameter for differential privacy')
         parser.add_argument('--max-grad-norm', type=float, default=1.0, help='parameter for differential privacy')
-
+        parser.add_argument('--stats', action='store_true', help='whether to compute statistics only')
 
 
     def get_dummy_state(self, *cmdargs, yaml_file=None, **opt_pairs):
@@ -528,6 +528,14 @@ class BaseOptions(object):
         if state.world_rank != 0:
             train_dataset = datasets.get_dataset(state, 'train')
             test_dataset = datasets.get_dataset(state, 'test')
+
+        if state.opt.dp == 'B':
+            state.opt.batch_size = 1
+            print('state.opt.batch_size set to ', state.opt.batch_size)
+
+        if state.opt.stats:
+            # effectively disable gradient clipping
+            state.opt.max_grad_norm = 1e8
 
         state.opt.train_loader = torch.utils.data.DataLoader(
             train_dataset, batch_size=state.batch_size,
