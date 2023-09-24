@@ -10,7 +10,7 @@ import torch.optim as optim
 from basics import task_loss, final_objective_loss, evaluate_steps
 from utils.distributed import broadcast_coalesced, all_reduce_coalesced
 from utils.io import save_results
-
+from get_dp import get_noise_multiplier
 
 def permute_list(list):
     indices = np.random.permutation(len(list))
@@ -82,40 +82,18 @@ class Trainer(object):
 
     def forward(self, model, rdata, rlabel, steps):
         state = self.state
-        if state.dp != 'none':
-            noise_multiplier = state.max_grad_norm / state.epsilon * math.sqrt(2 * math.log(1.25 / state.delta))
-            # print(f"Noise Multiplier: {noise_multiplier}")
 
         # forward
         model.train()
         w = model.get_param()
         params = [w]
         gws = []
-        points = []
 
         for step_i, (data, label, lr) in enumerate(steps):
-            if state.dp != 'none':
-                with torch.enable_grad():
-                    output = model.forward_with_param(data, w)
-                    loss = task_loss(state, output, label)
-                gw, = torch.autograd.grad(loss, w, lr.squeeze(), create_graph=True)
-            else:
-                gradients = []
-                for x, y in zip(data, label):
-                    with torch.enable_grad():
-                        output = model.forward_with_param(x.unsqueeze(0), w)
-                        loss = task_loss(state, output, y.unsqueeze(0))
-                    gw_i, = torch.autograd.grad(loss, w, create_graph=True)
-                    points.append(gw_i.data.norm(2).item())
-                    clip_coef = state.max_grad_norm / (gw_i.data.norm(2) + 1e-7)
-                    #if clip_coef < 1:
-                        #gw_i.mul_(clip_coef)
-                    gradients.append(gw_i)
-                gradients = torch.stack(gradients).mean(dim=0)
-                #noise = torch.randn_like(gradients) * noise_multiplier
-                gw = gradients #+ noise
-
-                gw = lr.squeeze() * gw
+            with torch.enable_grad():
+                output = model.forward_with_param(data, w)
+                loss = task_loss(state, output, label)
+            gw, = torch.autograd.grad(loss, w, lr.squeeze(), create_graph=True)
 
             with torch.no_grad():
                 new_w = w.sub(gw).requires_grad_()
@@ -127,7 +105,7 @@ class Trainer(object):
         model.eval()
         output = model.forward_with_param(rdata, params[-1])
         ll = final_objective_loss(state, output, rlabel)
-        return ll, (ll, params, gws), points
+        return ll, (ll, params, gws)
 
     def backward(self, model, rdata, rlabel, steps, saved_for_backward):
         l, params, gws = saved_for_backward
@@ -215,6 +193,7 @@ class Trainer(object):
         state = self.state
         device = state.device
         train_iter = iter(state.train_loader)
+        print('totol distill epochs', state.epochs)
         for epoch in range(state.epochs):
             niter = len(train_iter)
             prefetch_it = max(0, niter - 2)
@@ -232,20 +211,29 @@ class Trainer(object):
         grad_divisor = state.sample_n_nets  # i.e., global sample_n_nets
         ckpt_int = state.checkpoint_interval
 
-        if state.dp == 'B':
-            noise_multiplier = state.max_grad_norm / state.epsilon * math.sqrt(2 * math.log(1.25 / state.delta))
-            state.batch_size = 1
-            print('state.batch_size set to ', state.batch_size)
+        print('state.dp', state.dp)
+        if state.dp != 'none' or state.stat:
+            #noise_multiplier = state.max_grad_norm / state.epsilon * math.sqrt(2 * math.log(1.25 / state.delta))
+            noise_multiplier = get_noise_multiplier(target_epsilon=state.epsilon, target_delta=state.delta,
+                                                    sample_rate=1024/50000, steps=int(50000 / 1024 * 20)) # assuming 20 epochs
+                                     #steps=args.dp_steps)
+        print('noise multiplier', noise_multiplier)
 
         data_t0 = time.time()
 
         f_points = []
+
+        if state.dp != 'none' or state.stat:
+            grad_accumulation_steps = state.org_batch_size
+            print('grad accumulation steps', grad_accumulation_steps)
+            grads_accumulator = [torch.zeros_like(param) for param in self.params]
         for epoch, it, (rdata, rlabel) in self.prefetch_train_loader_iter():
             data_t = time.time() - data_t0
-            if it == 0 and epoch > 0:
-                if len(f_points) > 0:
-                    print(f'Part B Epoch {epoch} cumulative statistics. min: {np.min(f_points)}, max: {np.max(f_points)}, median: {np.median(f_points)},'
-                          f'mean: {np.mean(f_points)}, variance: {np.var(f_points)}')
+            if state.stat:
+                if (it+1) % 100 == 0 : # if it == 0 and epoch > 0:
+                    if len(f_points) > 0:
+                        print(f'Part B Epoch {epoch} cumulative statistics. min: {np.min(f_points)}, max: {np.max(f_points)}, median: {np.median(f_points)},'
+                              f'mean: {np.mean(f_points)}, variance: {np.var(f_points)}')
                 # f_points = []
 
             if it == 0:
@@ -259,7 +247,7 @@ class Trainer(object):
 
             do_log_this_iter = it == 0 or (state.log_interval >= 0 and it % state.log_interval == 0)
 
-            self.optimizer.zero_grad()
+            #self.optimizer.zero_grad()
             rdata, rlabel = rdata.to(device, non_blocking=True), rlabel.to(device, non_blocking=True)
 
             if sample_n_nets == state.local_n_nets:
@@ -278,8 +266,7 @@ class Trainer(object):
                 if state.train_nets_type == 'unknown_init':
                     model.reset(state)
 
-                l, saved, points = self.forward(model, rdata, rlabel, steps)
-
+                l, saved = self.forward(model, rdata, rlabel, steps)
                 losses.append(l.detach())
                 grad_infos.append(self.backward(model, rdata, rlabel, steps, saved))
                 del l, saved
@@ -288,7 +275,7 @@ class Trainer(object):
             # all reduce if needed
             # average grad
             all_reduce_tensors = [p.grad for p in self.params]
-            b_bs = sum([len(p) for p in self.params if p.dim()==4])
+            # b_bs = sum([len(p) for p in self.params if p.dim()==4])
             if do_log_this_iter:
                 losses = torch.stack(losses, 0).sum()
                 all_reduce_tensors.append(losses)
@@ -299,24 +286,41 @@ class Trainer(object):
                 for t in all_reduce_tensors:
                     t.div_(grad_divisor)
 
-            if state.dp == 'B':
-                for g in all_reduce_tensors:  # excluding the last element: learning rate
-                    if g.dim() != 4:
-                        continue
-                    assert len(g) == self.num_per_step, print(g.shape, self.num_per_step)
-                    #for img_grad in g:
-                        #f_points.append(img_grad.data.norm(2).item())
-                        # clip_coef = state.max_grad_norm / (img_grad.data.norm(2) + 1e-7)
-                        #print(clip_coef)
-                        #if clip_coef < 1:
-                            #img_grad.mul_(clip_coef)
-                    #noise = torch.randn_like(g) * noise_multiplier
-                    #g.add_(noise)
-                flatten_gd = torch.cat([g.view(-1) for g in all_reduce_tensors if g.dim() == 4])
-                f_points.append(flatten_gd.data.norm(2).item())
+            # Accumulate current gradients
+            if state.dp != 'none' or state.stat:
+                with torch.no_grad():
+                    for param, grad_accum in zip(self.params, grads_accumulator):
+                        grad_accum.add_(param.grad.detach().clone() / grad_accumulation_steps)
 
-            # opt step
-            self.optimizer.step()
+                all_hyper_grads = all_reduce_tensors[:-1] if do_log_this_iter else all_reduce_tensors
+                flatten_gd = torch.cat([g.view(-1) for g in all_hyper_grads])
+                if state.dp != 'none':
+                    clip_coef = state.max_grad_norm / (flatten_gd.data.norm(2) + 1e-7)
+                    # print('clip_coef', clip_coef)
+                    if clip_coef < 1:
+                        for gd in all_hyper_grads:
+                            gd.mul_(clip_coef)
+                if state.stat:
+                    f_points.append(flatten_gd.data.norm(2).item())
+
+                # get the accumulated gradient and add noise
+                if (it+1) % grad_accumulation_steps == 0:
+                    noise = torch.randn_like(flatten_gd) * noise_multiplier * state.max_grad_norm
+                    st = ed = 0
+                    with torch.no_grad():
+                        for param, grad_accum in zip(self.params, grads_accumulator):
+                            ed = st + torch.numel(param)
+                            param.grad = grad_accum
+                            if state.dp != 'none':
+                                param.grad.add_(noise[st: ed].reshape(param.shape))
+                            st = ed
+                    self.optimizer.step()
+                    grads_accumulator = [torch.zeros_like(param) for param in self.params]
+
+            else:
+                self.optimizer.step()
+
+            self.optimizer.zero_grad()
             t = time.time() - t0
 
             if do_log_this_iter:

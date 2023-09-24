@@ -316,7 +316,7 @@ class BaseOptions(object):
         parser.add_argument('--epsilon', type=float, default=10., help='parameter for differential privacy')
         parser.add_argument('--delta', type=float, default=1e-5, help='parameter for differential privacy')
         parser.add_argument('--max-grad-norm', type=float, default=1.0, help='parameter for differential privacy')
-        parser.add_argument('--stats', action='store_true', help='whether to compute statistics only')
+        parser.add_argument('--stat', action='store_true', help='whether to compute statistics only')
 
 
     def get_dummy_state(self, *cmdargs, yaml_file=None, **opt_pairs):
@@ -529,13 +529,14 @@ class BaseOptions(object):
             train_dataset = datasets.get_dataset(state, 'train')
             test_dataset = datasets.get_dataset(state, 'test')
 
-        if state.opt.dp == 'B':
-            state.opt.batch_size = 1
-            print('state.opt.batch_size set to ', state.opt.batch_size)
+        if state.dp != 'none' or state.stat:
+            state.org_batch_size = state.batch_size
+            state.batch_size = 1
+            print('orignal ', state.org_batch_size, ', state.batch_size set to ', state.batch_size)
 
-        if state.opt.stats:
+        #if state.opt.stats:
             # effectively disable gradient clipping
-            state.opt.max_grad_norm = 1e8
+            # state.opt.max_grad_norm = 1e8
 
         state.opt.train_loader = torch.utils.data.DataLoader(
             train_dataset, batch_size=state.batch_size,
