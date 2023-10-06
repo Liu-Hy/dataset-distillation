@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0 nohup python main.py --mode distill_basic --dataset Cifar10 --arch ConvNet --distill_lr 0.001 --epsilon 10.0 --max-grad-norm 0.1124 --dp B > output10.log 2>&1 &
